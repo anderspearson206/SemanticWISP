@@ -1,0 +1,11 @@
+# Hyak environment, pinned to the versions in the laptop .venv (checked 2026-11-10).
+# On Linux the default PyPI torch wheels are the CUDA builds; the laptop uses the +cpu builds of the same versions.
+torch==2.14.1
+torchvision==0.29.1
+numpy==2.5.4
+pandas==3.1.0
+scipy==1.18.1
+scikit-learn==1.9.1
+pillow==13.0.0
+matplotlib==3.11.2
+PyYAML==6.0.3
