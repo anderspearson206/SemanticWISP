@@ -1,10 +1,12 @@
 """Baseline and thumbnail encoders through the simulator (approach categories 1 and 2).
 
-For each configuration W x H, bits per pixel, method (mean | subsample):
+For each configuration W x H, bits per pixel, method (mean | subsample | jpeg):
   1. replay the training sequences through tag -> link -> server and collect what the server receives,
   2. train a small CNN decoder on those received payloads,
   3. replay the test sequences with the trained decoder and record score, label and cost counts per query.
 160x120 at 8 bits is the uncompressed baseline. Train: `training`, `training_seats`. Test: `test1`-`test3`.
+method `jpeg` (semwisp.tag.JpegTag) is the conventional-codec baseline: the w x h thumbnail JPEG-encoded, and the
+"bits" field is the JPEG quality instead (e.g. 160x120:25:jpeg). Its payload size varies per frame.
 
 Results go to results/thumbnail_sweep/<config>.npz, one per configuration; existing files are skipped and an
 interrupted training resumes from its checkpoint.
@@ -24,12 +26,14 @@ from semwisp.link import Link
 from semwisp.sensor import Sensor
 from semwisp.server import CNNDecoder, OneShotServer
 from semwisp.sim import replay
-from semwisp.tag import ThumbnailTag
+from semwisp.tag import JpegTag, ThumbnailTag
 
 TRAIN, TEST = ['training', 'training_seats'], ['test1', 'test2', 'test3']
 GRID = ([f'{w}x{h}:8:mean' for w, h in [(160, 120), (80, 60), (40, 30), (32, 24), (16, 12), (8, 6), (4, 3)]]
         + [f'{w}x{h}:{b}:mean' for w, h in [(32, 24), (16, 12), (8, 6)] for b in (4, 2, 1)]
-        + [f'{w}x{h}:8:subsample' for w, h in [(32, 24), (16, 12), (8, 6), (4, 3)]])
+        + [f'{w}x{h}:8:subsample' for w, h in [(32, 24), (16, 12), (8, 6), (4, 3)]]
+        + [f'{s}:{q}:jpeg' for s, q in [('160x120', 5), ('160x120', 25), ('160x120', 90), ('80x60', 10),
+                                         ('80x60', 50), ('32x24', 10), ('32x24', 50), ('16x12', 5), ('16x12', 25)]])
 
 
 def main():
@@ -49,16 +53,16 @@ def main():
     for cfg in args.configs:
         size, bits, method = cfg.split(':')
         w, h = map(int, size.split('x'))
-        name = f'{size}_b{bits}_{method}{suffix}'
+        name = f'{size}_{"q" if method == "jpeg" else "b"}{bits}_{method}{suffix}'
         out, ckpt = args.out / f'{name}.npz', args.out / f'{name}.ckpt'
         if out.exists():
             print(f'skip {name} (exists)')
             continue
         t0 = time.time()
-        tag = ThumbnailTag(w, h, int(bits), method)
+        tag = JpegTag(w, h, int(bits)) if method == 'jpeg' else ThumbnailTag(w, h, int(bits), method)
         world = dict(link=Link(p_loss=args.p_loss, seed=args.seed),
                      sensor=Sensor(read_noise=args.read_noise, seed=args.seed))
-        print(f'{name}: {tag.n_bytes} bytes per query', flush=True)
+        print(f'{name}: {getattr(tag, "n_bytes", "variable")} bytes per query', flush=True)
 
         tr = replay({n: frames[n] for n in TRAIN}, tag, OneShotServer(tag.unpack), stride=args.train_stride,
                     keep_payloads=True, **world)
@@ -69,10 +73,10 @@ def main():
         te = replay({n: frames[n] for n in TEST}, tag, OneShotServer(tag.unpack, decoder), **world).df
         auc = {n: piropo.auc(g.score, g.label) for n, g in te.groupby('seq')}
         auc['pooled'] = piropo.auc(te.score, te.label)
-        meta = dict(config=cfg, w=w, h=h, bits=int(bits), method=method, n_bytes=tag.n_bytes, n_train=len(X),
+        meta = dict(config=cfg, w=w, h=h, bits=int(bits), method=method, n_bytes=float(te.up_bytes.mean()), n_train=len(X),
                     epochs=args.epochs, read_noise=args.read_noise, p_loss=args.p_loss, seed=args.seed,
                     device=decoder.device, auc=auc, seconds=round(time.time() - t0))
-        np.savez(out, meta=json.dumps(meta), **{c: te[c].values.astype(str) if c == 'seq' else te[c].values for c in te.columns})
+        np.savez(out, meta=json.dumps(meta), **{c: np.array(te[c].tolist(), dtype=str) if c == 'seq' else te[c].values for c in te.columns})
         ckpt.unlink(missing_ok=True)
         print(f'  test AUC {", ".join(f"{k} {v:.3f}" for k, v in auc.items())}  ({meta["seconds"]}s) -> {out.name}',
               flush=True)

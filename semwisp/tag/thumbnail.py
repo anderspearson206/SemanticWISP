@@ -6,6 +6,14 @@ from ..piropo import H, W
 from ..sim import Tag
 
 
+def block_mean(x, w, h):
+    """The tag's integer block average of a 120x160 uint8 frame to h x w (rounded to nearest). The server uses
+    the same function on full frames, so both sides compute identical thumbnails."""
+    bw, bh = W // w, H // h
+    n = bw * bh
+    return ((x.reshape(*x.shape[:-2], h, bh, w, bw).sum((-3, -1), dtype=np.uint32) + n // 2) // n).astype(np.uint8)
+
+
 class ThumbnailTag(Tag):
     """Sends a w x h thumbnail with `bits` bits per pixel (the top bits of each value).
 
@@ -22,7 +30,7 @@ class ThumbnailTag(Tag):
         x, (bw, bh) = self.frame(), (W // self.w, H // self.h)
         if self.method == 'mean':
             n = bw * bh
-            q = (x.reshape(self.h, bh, self.w, bw).sum((1, 3), dtype=np.uint32) + n // 2) // n
+            q = block_mean(x, self.w, self.h)
             self.ledger.mcu_ops += x.size + 2 * self.w * self.h         # one add per pixel; divide + shift per output
             acc = self.w * (2 if 255 * n < 65536 else 4)                # one row of accumulators
         else:

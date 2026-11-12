@@ -81,13 +81,18 @@ class Trace:
     payloads: list          # per query, the list of Received objects (empty unless keep_payloads)
 
 
-def replay(seqs, tag, server, link=None, sensor=None, stride=1, max_rounds=16, keep_payloads=False):
-    """Run every `stride`-th non-corrupted frame of each sequence in `seqs` (from frames.load_frames)."""
+def replay(seqs, tag, server, link=None, sensor=None, stride=1, max_rounds=16, keep_payloads=False, reset=True):
+    """Run every `stride`-th non-corrupted frame of each sequence in `seqs` (from frames.load_frames).
+
+    reset=False keeps tag and server state from one sequence to the next (an adaptive deployment: the tag's
+    configuration is in FRAM and the server keeps learning). A server may define info() -> dict; its entries
+    are added to the row of each query."""
     link, sensor = link or Link(), sensor or Sensor()
     rows, payloads = [], []
     for name, s in seqs.items():
-        tag.reset()
-        server.reset()
+        if reset:
+            tag.reset()
+            server.reset()
         for i in range(0, len(s['X']), stride):
             if s['bad'][i]:
                 continue
@@ -102,6 +107,7 @@ def replay(seqs, tag, server, link=None, sensor=None, stride=1, max_rounds=16, k
                 if keep_payloads:
                     got.append(rx)
             rows.append(dict(seq=name, idx=i, t=s['t'][i], label=int(s['label'][i]) if 'label' in s else -1,
-                             score=server.decide(), **{f.name: getattr(ledger, f.name) for f in fields(ledger)}))
+                             score=server.decide(), **{f.name: getattr(ledger, f.name) for f in fields(ledger)},
+                             **(server.info() if hasattr(server, 'info') else {})))
             payloads.append(got)
     return Trace(pd.DataFrame(rows), payloads)
