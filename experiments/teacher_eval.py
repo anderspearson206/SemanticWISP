@@ -9,10 +9,11 @@ The current teacher is frcnn_mnv3_320@320 (results/coco_detectors/frcnn_mnv3_320
 
 Results: results/teachers/<teacher>_s<stride>/<sequence>.npz with keys t, idx, score, box (x1, y1, x2, y2 in
 160x120 pixels); one file per sequence, skipped if it exists, so the script can be interrupted and rerun.
-Sequence 'mall_tile' is the Mall tile of the switch stream (every frame; --mall).
+Sequence 'mall_tile' is the Mall tile of the switch stream (every frame; --mall). A sequence in progress is
+checkpointed to <sequence>.part.npz every --chunk frames and resumed from there.
 
   python experiments/teacher_eval.py --stride 8 --teachers frcnn_mnv3_320@320 frcnn_r50v2@480 retina_r50v2@480
-  python experiments/teacher_eval.py --stride 2 --mall --teachers kprcnn_r50@480+flip
+  python experiments/teacher_eval.py --stride 2 --mall --batch 2 --teachers fcos_r50@480
 """
 import argparse, sys, time
 from pathlib import Path
@@ -33,6 +34,7 @@ MODELS = {   # name -> (constructor, weights)
     'fcos_r50': (D.fcos_resnet50_fpn, D.FCOS_ResNet50_FPN_Weights.DEFAULT),
     'kprcnn_r50': (D.keypointrcnn_resnet50_fpn, D.KeypointRCNN_ResNet50_FPN_Weights.DEFAULT),
 }
+ONE_STAGE = {'retina_r50v2', 'fcos_r50'}
 PERSON = 1   # COCO category id in torchvision detection models
 OUT = piropo.REPO / 'results' / 'teachers'
 
@@ -46,8 +48,11 @@ def parse(teacher):
 
 def build(model, size, device):
     fn, weights = MODELS[model]
+    # one-stage detectors call their score floor score_thresh; torchvision silently ignores box_score_thresh there
+    # (FCOS and RetinaNet results scored before 2026-11-13 have floors 0.2 and 0.05: scores below are 0)
+    thresh = {'score_thresh' if model in ONE_STAGE else 'box_score_thresh': 0.01}
     # 160x120 frames: min_size scales the short side to `size`; max_size must not bind for a 4:3 frame
-    return fn(weights=weights, box_score_thresh=0.01, min_size=size, max_size=size * 4 // 3 + 1).eval().to(device)
+    return fn(weights=weights, min_size=size, max_size=size * 4 // 3 + 1, **thresh).eval().to(device)
 
 
 def best_person(det):
@@ -81,6 +86,8 @@ def main():
     ap.add_argument('--seqs', nargs='+', default=piropo.ANNOTATED)
     ap.add_argument('--mall', action='store_true', help='also score every frame of the Mall tile')
     ap.add_argument('--out', type=Path, default=OUT)
+    ap.add_argument('--batch', type=int, default=8, help='frames per forward pass (lower it for memory)')
+    ap.add_argument('--chunk', type=int, default=200, help='checkpoint a sequence every n frames')
     args = ap.parse_args()
     for t in args.teachers:
         assert parse(t)[0] in MODELS, t
@@ -103,13 +110,31 @@ def main():
                 print(f'skip {teacher} {name} (exists)', flush=True)
                 continue
             model = model or build(model_name, size, device)
-            t0 = time.time()
-            sc, bx = score(model, s['X'][idx], flip, device)
-            tmp = out.with_name(out.stem + '.tmp.npz')
-            np.savez(tmp, t=s['t'][idx], idx=idx, score=sc, box=bx)
-            tmp.replace(out)
+            part = out.with_name(out.stem + '.part.npz')
+            sc, bx = np.zeros(len(idx), np.float32), np.zeros((len(idx), 4), np.float32)
+            done = 0
+            if part.exists():
+                with np.load(part) as z:
+                    done = len(z['score'])
+                    sc[:done], bx[:done] = z['score'], z['box']
+                print(f'resume {teacher} {name} at {done}/{len(idx)}', flush=True)
+            t0, n0 = time.time(), done
+            while done < len(idx):
+                end = min(done + args.chunk, len(idx))
+                sc[done:end], bx[done:end] = score(model, s['X'][idx[done:end]], flip, device, args.batch)
+                done = end
+                tmp = out.with_name(out.stem + '.tmp.npz')
+                if done < len(idx):
+                    np.savez(tmp, score=sc[:done], box=bx[:done])
+                    tmp.replace(part)
+                    print(f'  {teacher} {name}: {done}/{len(idx)}', flush=True)
+                else:
+                    np.savez(tmp, t=s['t'][idx], idx=idx, score=sc, box=bx)
+                    tmp.replace(out)
+                    part.unlink(missing_ok=True)
+            n = max(len(idx) - n0, 1)
             print(f'{teacher} {name}: {len(idx)} frames, {time.time() - t0:.0f}s '
-                  f'({(time.time() - t0) / len(idx):.2f} s/frame)', flush=True)
+                  f'({(time.time() - t0) / n:.2f} s/frame)', flush=True)
 
 
 if __name__ == '__main__':

@@ -12,7 +12,10 @@ Streams (as in online_adaptation.py)
   switch   the tag is moved: PIROPO `training` -> a Mall tile -> PIROPO `training_seats` + `test2`. One pass.
            Now with a detector teacher too (results/coco_detectors/frcnn_mnv3_320_mall_tile_160x120.npz,
            from `coco_detector_eval.py --mall-tile`).
-Teachers: `detector` (COCO detector on the 160x120 frame; no labels used anywhere) and `oracle` (ground truth).
+Teachers: `detector` (COCO detector on the 160x120 frame; no labels used anywhere), `fcos` (FCOS at 480, a
+          stronger detector, results/teachers/fcos_r50@480_s2/; its cutoffs come from its score distribution on
+          unannotated PIROPO footage, semwisp.calibrate.asymmetric_cutoffs) and `oracle` (ground truth).
+          Each teacher has its own label cutoffs (TEACHER_CUTOFFS): score scales differ between detectors.
 Learners: online_pixels (OnlineLearner, 96 single pixels), online_cells (OnlineLearner, whole blocks),
           batch_cells (BatchLearner, the baseline).
 Checks:   full (AdaptiveServer) or tiered (TieredServer).
@@ -31,6 +34,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from semwisp import piropo
+from semwisp.calibrate import asymmetric_cutoffs
 from semwisp.frames import load_frames, load_mall_tile
 from semwisp.metrics import summary
 from semwisp.server import AdaptiveServer, BatchLearner, CachedTeacher, OnlineLearner, TieredServer
@@ -41,13 +45,16 @@ from semwisp.tag.interval import CELLS, lattice, sparse
 ORDER = ['training', 'test3', 'test1', 'training_seats', 'test2']
 STRIDE = 2
 DET = piropo.REPO / 'results' / 'coco_detectors'
+FCOS = piropo.REPO / 'results' / 'teachers' / 'fcos_r50@480_s2'
+FCOS_CALIB = piropo.REPO / 'results' / 'teachers' / 'fcos_r50@480_s4'      # unannotated sequences only
+TEACHERS = ('detector', 'fcos', 'oracle')
 LEARNERS = dict(online_pixels=lambda k: OnlineLearner(k=k, table=sparse(lattice(4), 4)),
                 online_cells=lambda k: OnlineLearner(k=k, table=CELLS),
                 batch_cells=lambda k: BatchLearner(k=k, table=CELLS))
 BOOTSTRAPS = [25, 50, 100, 200, 400]
-RUNS = ([(s, t, l, c, 200) for s in ('piropo', 'switch') for t in ('detector', 'oracle') for l in LEARNERS
+RUNS = ([(s, t, l, c, 200) for s in ('piropo', 'switch') for t in TEACHERS for l in LEARNERS
          for c in ('full', 'tiered')]
-        + [('switch', t, l, 'tiered', b) for t in ('detector', 'oracle') for l in ('online_pixels', 'batch_cells')
+        + [('switch', t, l, 'tiered', b) for t in TEACHERS for l in ('online_pixels', 'batch_cells')
            for b in BOOTSTRAPS if b != 200])
 
 
@@ -55,17 +62,30 @@ def every(s, k):
     return {f: v[::k] for f, v in s.items()}
 
 
+def fcos_cutoffs():
+    """FCOS label cutoffs (person, empty) from its scores on unannotated PIROPO sequences (none of them in a stream)."""
+    scores = np.concatenate([np.load(f)['score'] for f in sorted(FCOS_CALIB.glob('*.npz')) if '.part' not in f.name])
+    return asymmetric_cutoffs(scores)
+
+
 def setup():
-    """(streams, teachers): streams[name] is a list of passes, each {sequence name: frames}; teachers[name] is a
-    CachedTeacher."""
+    """(streams, teachers): streams[name] is a list of passes, each {sequence name: frames}; teachers[name] is
+    (CachedTeacher, person cutoff, empty cutoff)."""
     P = {n: every(s, STRIDE) for n, s in load_frames(ORDER).items()}
     mall = load_mall_tile()
     det, det_mall = np.load(DET / 'frcnn_mnv3_320_160x120_s2.npz'), np.load(DET / 'frcnn_mnv3_320_mall_tile_160x120.npz')
     assert (det_mall['t'] == mall['t']).all()
     t = np.concatenate([P[n]['t'] for n in ORDER] + [mall['t']])
     truth = np.concatenate([P[n]['label'] for n in ORDER] + [mall['label']]).astype(float)
-    teachers = dict(oracle=CachedTeacher(t, np.where(truth < 0, 0.45, truth)),     # 0.45: no opinion
-                    detector=CachedTeacher(t, np.concatenate([det[f'score_{n}'] for n in ORDER] + [det_mall['score']])))
+    fcos = {n: np.load(FCOS / f'{n}.npz') for n in ORDER + ['mall_tile']}
+    for n in ORDER:
+        assert (fcos[n]['t'] == P[n]['t']).all(), n
+    assert (fcos['mall_tile']['t'] == mall['t']).all()
+    teachers = dict(oracle=(CachedTeacher(t, np.where(truth < 0, 0.45, truth)), 0.6, 0.3),     # 0.45: no opinion
+                    detector=(CachedTeacher(t, np.concatenate([det[f'score_{n}'] for n in ORDER] + [det_mall['score']])),
+                              0.6, 0.3),
+                    fcos=(CachedTeacher(t, np.concatenate([fcos[n]['score'] for n in ORDER + ['mall_tile']])),
+                          *fcos_cutoffs()))
     streams = dict(piropo=[P] * 2,
                    switch=[{'room A (training)': P['training'], 'room B (mall tile)': mall,
                             'room A, rearranged': P['training_seats'], 'room A, rearranged (test2)': P['test2']}])
@@ -73,9 +93,11 @@ def setup():
 
 
 def make_server(teacher, learner, check, boot, k=96, margin=2.0):
+    """teacher: (CachedTeacher, person cutoff, empty cutoff)."""
+    teach, pos, neg = teacher
     L = LEARNERS[learner](k)
-    return (TieredServer(teacher, L, bootstrap=boot, code_margin=margin) if check == 'tiered'
-            else AdaptiveServer(teacher, L, bootstrap=boot))
+    return (TieredServer(teach, L, bootstrap=boot, code_margin=margin, pos_thr=pos, neg_thr=neg) if check == 'tiered'
+            else AdaptiveServer(teach, L, bootstrap=boot, pos_thr=pos, neg_thr=neg))
 
 
 def main():
@@ -104,6 +126,7 @@ def main():
         df = pd.concat(parts, ignore_index=True)
         code = server.active[0]
         meta = dict(name=name, stream=stream, teacher=teacher, learner=learner, check=check, bootstrap=boot,
+                    pos_thr=teachers[teacher][1], neg_thr=teachers[teacher][2],
                     k=args.k, margin=args.margin if check == 'tiered' else None, bits=len(code.cell),
                     pixels_read=code.n_pixels, seconds=round(time.time() - t0),
                     by_pass={p: summary(g) for p, g in df.groupby('pass')})
