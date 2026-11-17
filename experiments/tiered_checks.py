@@ -17,7 +17,8 @@ Teachers: `detector` (COCO detector on the 160x120 frame; no labels used anywher
           unannotated PIROPO footage, semwisp.calibrate.asymmetric_cutoffs) and `oracle` (ground truth).
           Each teacher has its own label cutoffs (TEACHER_CUTOFFS): score scales differ between detectors.
 Learners: online_pixels (OnlineLearner, 96 single pixels), online_cells (OnlineLearner, whole blocks),
-          batch_cells (BatchLearner, the baseline).
+          batch_cells (BatchLearner, the baseline); online_pixels_cal and online_cells_cal are the online learners
+          with a calibrated decoder (shrink=0.3, threshold='gauss'; see experiments/learner_ablation.py).
 Checks:   full (AdaptiveServer) or tiered (TieredServer).
 
 Results: results/tiered_checks/<stream>_<teacher>_<learner>_<check>_b<bootstrap>.npz, one row per query;
@@ -46,16 +47,21 @@ ORDER = ['training', 'test3', 'test1', 'training_seats', 'test2']
 STRIDE = 2
 DET = piropo.REPO / 'results' / 'coco_detectors'
 FCOS = piropo.REPO / 'results' / 'teachers' / 'fcos_r50@480_s2'
+FCOS_JPEG = piropo.REPO / 'results' / 'teachers' / 'fcos_r50@480_jpeg160x120q88_s2'   # switch stream only
+FULL_JPEG = 88                     # teacher fcos_jpeg: the tag sends full frames as 160x120 JPEG at this quality
 FCOS_CALIB = piropo.REPO / 'results' / 'teachers' / 'fcos_r50@480_s4'      # unannotated sequences only
 TEACHERS = ('detector', 'fcos', 'oracle')
 LEARNERS = dict(online_pixels=lambda k: OnlineLearner(k=k, table=sparse(lattice(4), 4)),
                 online_cells=lambda k: OnlineLearner(k=k, table=CELLS),
+                online_pixels_cal=lambda k: OnlineLearner(k=k, table=sparse(lattice(4), 4), shrink=0.3, threshold='gauss'),
+                online_cells_cal=lambda k: OnlineLearner(k=k, table=CELLS, shrink=0.3, threshold='gauss'),
                 batch_cells=lambda k: BatchLearner(k=k, table=CELLS))
 BOOTSTRAPS = [25, 50, 100, 200, 400]
 RUNS = ([(s, t, l, c, 200) for s in ('piropo', 'switch') for t in TEACHERS for l in LEARNERS
          for c in ('full', 'tiered')]
         + [('switch', t, l, 'tiered', b) for t in TEACHERS for l in ('online_pixels', 'batch_cells')
-           for b in BOOTSTRAPS if b != 200])
+           for b in BOOTSTRAPS if b != 200]
+        + [('switch', 'fcos_jpeg', l, 'tiered', 200) for l in ('online_pixels_cal', 'online_cells_cal')])
 
 
 def every(s, k):
@@ -86,18 +92,24 @@ def setup():
                               0.6, 0.3),
                     fcos=(CachedTeacher(t, np.concatenate([fcos[n]['score'] for n in ORDER + ['mall_tile']])),
                           *fcos_cutoffs()))
+    sw = ['training', 'training_seats', 'test2', 'mall_tile']          # FCOS on the decoded JPEG full frames
+    fj = {n: np.load(FCOS_JPEG / f'{n}.npz') for n in sw}
+    for n in sw:
+        assert (fj[n]['t'] == (mall['t'] if n == 'mall_tile' else P[n]['t'])).all(), n
+    teachers['fcos_jpeg'] = (CachedTeacher(np.concatenate([fj[n]['t'] for n in sw]),
+                                           np.concatenate([fj[n]['score'] for n in sw])), *teachers['fcos'][1:])
     streams = dict(piropo=[P] * 2,
                    switch=[{'room A (training)': P['training'], 'room B (mall tile)': mall,
                             'room A, rearranged': P['training_seats'], 'room A, rearranged (test2)': P['test2']}])
     return streams, teachers
 
 
-def make_server(teacher, learner, check, boot, k=96, margin=2.0):
-    """teacher: (CachedTeacher, person cutoff, empty cutoff)."""
+def make_server(teacher, learner, check, boot, k=96, margin=2.0, jpeg=None):
+    """teacher: (CachedTeacher, person cutoff, empty cutoff). jpeg: quality of JPEG full frames (None: raw)."""
     teach, pos, neg = teacher
     L = LEARNERS[learner](k)
-    return (TieredServer(teach, L, bootstrap=boot, code_margin=margin, pos_thr=pos, neg_thr=neg) if check == 'tiered'
-            else AdaptiveServer(teach, L, bootstrap=boot, pos_thr=pos, neg_thr=neg))
+    kw = dict(bootstrap=boot, pos_thr=pos, neg_thr=neg, full_jpeg=jpeg)
+    return (TieredServer(teach, L, code_margin=margin, **kw) if check == 'tiered' else AdaptiveServer(teach, L, **kw))
 
 
 def main():
@@ -119,15 +131,16 @@ def main():
             print(f'skip {name} (exists)')
             continue
         t0 = time.time()
-        server = make_server(teachers[teacher], learner, check, boot, args.k, args.margin)
-        tag, parts = IntervalCodeTag(), []
+        jpeg = FULL_JPEG if teacher == 'fcos_jpeg' else None
+        server = make_server(teachers[teacher], learner, check, boot, args.k, args.margin, jpeg)
+        tag, parts = IntervalCodeTag(full_jpeg=jpeg), []
         for p, seqs in enumerate(streams[stream], 1):
             parts.append(replay(seqs, tag, server, reset=False).df.assign(**{'pass': p}))
         df = pd.concat(parts, ignore_index=True)
         code = server.active[0]
         meta = dict(name=name, stream=stream, teacher=teacher, learner=learner, check=check, bootstrap=boot,
                     pos_thr=teachers[teacher][1], neg_thr=teachers[teacher][2],
-                    k=args.k, margin=args.margin if check == 'tiered' else None, bits=len(code.cell),
+                    full_jpeg=jpeg, k=args.k, margin=args.margin if check == 'tiered' else None, bits=len(code.cell),
                     pixels_read=code.n_pixels, seconds=round(time.time() - t0),
                     by_pass={p: summary(g) for p, g in df.groupby('pass')})
         np.savez(out, meta=json.dumps(meta),

@@ -77,6 +77,21 @@ class Linear:
         return bits @ self.coef_[0] + self.intercept_
 
 
+def gauss_cross(mu0, s0, mu1, s1):
+    """The score between mu0 and mu1 where two equal-weight Gaussians N(mu0, s0) and N(mu1, s1) cross (the
+    balanced-error threshold if the classes' decoder outputs are Gaussian); the midpoint if there is none."""
+    lo, hi = min(mu0, mu1), max(mu0, mu1)
+    if abs(s0 - s1) < 1e-9 * max(s0, s1):
+        return (mu0 + mu1) / 2
+    a = 1 / s0 ** 2 - 1 / s1 ** 2
+    b = -2 * (mu0 / s0 ** 2 - mu1 / s1 ** 2)
+    c = mu0 ** 2 / s0 ** 2 - mu1 ** 2 / s1 ** 2 + 2 * np.log(s0 / s1)
+    roots = np.roots([a, b, c])
+    roots = roots[np.isreal(roots)].real
+    inside = roots[(roots > lo) & (roots < hi)]
+    return float(inside[0]) if len(inside) else (mu0 + mu1) / 2
+
+
 class OnlineLearner:
     """Constant-time learning from a stream of labelled frames; no frames are stored and nothing is refitted.
 
@@ -92,14 +107,26 @@ class OnlineLearner:
     a chosen one says is worth nothing), and the decoder is the linear discriminant of the picked bits.
     Memory and time per labelled frame grow with the square of the number of candidates.
 
+    Decoder options (defaults reproduce the original learner):
+      shrink     shrink the covariance towards its diagonal before solving for the decoder weights (0..1). With
+                 binary bits that are rarely set, the plain covariance gives such bits huge weights.
+      threshold  'midpoint': halfway between the two class means of the decoder output (the original);
+                 'gauss': where the two classes' Gaussians of the decoder output cross, with each class's spread
+                 from its own running covariance (kept only for this option). Both use running statistics only.
+      In experiments/learner_ablation.py (true labels, held-out time blocks) shrink=0.3 with 'gauss' raised the Mall
+      tile from 0.89 / 0.86 to 0.96 / 0.95 balanced accuracy (cells / pixels) and room A2 cells from 0.78 to 0.85.
+
     Change detection: fading is too slow for an abrupt change (the tag is moved, the furniture is rearranged).
     If `change_after` empty-labelled frames in a row have more than `change_frac` of all candidate bits set,
     the background it learned no longer describes the room: it discards its statistics, raises `changed`, and
     starts again from that frame."""
 
-    def __init__(self, k=96, table=CELLS, half_life=200, ridge=1e-3, change_frac=0.3, change_after=3):
+    def __init__(self, k=96, table=CELLS, half_life=200, ridge=1e-3, change_frac=0.3, change_after=3,
+                 shrink=0.0, threshold='midpoint'):
         assert len(table) <= 2000, 'the covariance is len(table) squared'
+        assert threshold in ('midpoint', 'gauss')
         self.k, self.table, self.ridge = k, table, ridge
+        self.shrink, self.threshold = shrink, threshold
         self.change_frac, self.change_after = change_frac, change_after
         self.alpha = 1 - 0.5 ** (1 / half_life)
         self.area = n_samples(table)
@@ -111,6 +138,7 @@ class OnlineLearner:
         self.mu = self.dev = None
         self.m = np.zeros((2, len(self.table)))
         self.S = np.zeros((len(self.table), len(self.table)))
+        self.Sc = np.zeros((2, len(self.table), len(self.table))) if self.threshold == 'gauss' else None
         self.seen = self.odd = 0                       # labelled frames in m and S; odd-looking empties in a row
 
     def _full(self):
@@ -129,6 +157,8 @@ class OnlineLearner:
             d = x - self.m[label]
             self.m[label] += max(self.alpha, 1 / (self.n[label] + 1)) * d          # plain averages at first
             self.S += max(self.alpha, 1 / (self.seen + 1)) * (np.outer(d, x - self.m[label]) - self.S)
+            if self.Sc is not None:                   # per-class covariance, for the 'gauss' threshold
+                self.Sc[label] += max(self.alpha, 1 / (self.n[label] + 1)) * (np.outer(d, x - self.m[label]) - self.Sc[label])
             self.seen += 1
         if label == 0:
             mean = sums / self.area
@@ -159,10 +189,17 @@ class OnlineLearner:
             r = r - col * r[j]
             A = A - np.outer(col, A[j])
         sel = np.sort(sel)
-        w = np.linalg.solve(S[np.ix_(sel, sel)], gap[sel])
+        Ss = S[np.ix_(sel, sel)]
+        if self.shrink:
+            Ss = (1 - self.shrink) * Ss + self.shrink * np.diag(Ss.diagonal() + 0.01)
+        w = np.linalg.solve(Ss, gap[sel])
+        mu0, mu1 = w @ self.m[0, sel], w @ self.m[1, sel]
+        cut = (mu0 + mu1) / 2
+        if self.threshold == 'gauss':
+            sd = [np.sqrt(max(w @ self.Sc[c][np.ix_(sel, sel)] @ w, 1e-12)) for c in (0, 1)]
+            cut = gauss_cross(mu0, sd[0], mu1, sd[1])
         full = self._full()
-        return (IntervalCode(sel, full.lo[sel], full.hi[sel], self.table),
-                Linear(w, -w @ (self.m[0, sel] + self.m[1, sel]) / 2))
+        return IntervalCode(sel, full.lo[sel], full.hi[sel], self.table), Linear(w, -cut)
 
 
 class CachedTeacher:
@@ -178,12 +215,23 @@ class CachedTeacher:
 
 class AdaptiveServer(Server):
     def __init__(self, teacher, learner, bootstrap=200, relearn_every=50, pos_thr=0.6, neg_thr=0.3,
-                 max_interval=64, adapt=True):
+                 max_interval=64, adapt=True, noise_floor=0.0, full_jpeg=None):
         """teacher(t, frame) -> person score in [0, 1]. A full frame is used as a label only when the teacher
         is confident: score >= pos_thr (person) or <= neg_thr (empty).
-        adapt=False: learn once after the bootstrap, then never check or relearn."""
+        adapt=False: learn once after the bootstrap, then never check or relearn.
+        Check schedule: every `interval` queries, interval = 0.25 / disagreement (running rate at which the code
+        and the teacher disagree), between 2 and max_interval. noise_floor is subtracted from the disagreement
+        first: the share of disagreements expected from the teacher's own errors, which a perfect code would
+        still show (default 0: the original schedule).
+        full_jpeg: JPEG quality the tag sends full frames at (IntervalCodeTag(full_jpeg=...)); the server decodes
+        them, and the teacher and learner see the decoded frame. None: raw frames."""
         self.teacher, self.learner, self.bootstrap, self.relearn_every = teacher, learner, bootstrap, relearn_every
         self.pos_thr, self.neg_thr, self.max_interval, self.adapt = pos_thr, neg_thr, max_interval, adapt
+        self.noise_floor = noise_floor
+        self.jpeg = None
+        if full_jpeg is not None:
+            from ..tag.jpeg import JpegTag
+            self.jpeg = JpegTag(W, H, full_jpeg)
         self.active = self.pending = None          # (IntervalCode, decoder) in use / learned but not yet sent
         self.new = self.since = 0                  # labelled frames since the last code; queries since a check
         self.disagree, self.interval = 0.25, 2     # running disagreement rate between code and teacher
@@ -217,7 +265,7 @@ class AdaptiveServer(Server):
             code, dec = self.active
             self.logit = float(dec.decision_function(B.unpack(rx.data, 1, len(code.cell))[None].astype(float))[0])
         else:
-            frame = rx.data.reshape(H, W)
+            frame = self.frame_of(rx)
             self.full = self.teacher(self.t, frame)
             label = 1 if self.full >= self.pos_thr else 0 if self.full <= self.neg_thr else None
             if label is None:
@@ -229,7 +277,16 @@ class AdaptiveServer(Server):
                 self.new, self.disagree, self.interval = 0, 0.25, 2
             elif self.logit is not None:
                 self.disagree += 0.1 * (float((self.logit > 0) != label) - self.disagree)
-                self.interval = int(np.clip(round(0.25 / max(self.disagree, 1e-3)), 2, self.max_interval))
+                self.set_interval()
+
+    def frame_of(self, rx):
+        """The full frame a 'full' reply carries, decoded if the tag sent it as JPEG."""
+        if self.jpeg is None:
+            return rx.data.reshape(H, W)
+        return self.jpeg.decode(rx.data).reshape(H, W)
+
+    def set_interval(self):
+        self.interval = int(np.clip(round(0.25 / max(self.disagree - self.noise_floor, 1e-3)), 2, self.max_interval))
 
     def decide(self):
         """Score in [0, 1]. When the full frame was fetched this query, the teacher's answer is used."""

@@ -92,13 +92,24 @@ def code_bits(sums, code):
 class IntervalCodeTag(Tag):
     """Requests: 'full' -> the raw frame; 'config' -> store a new IntervalCode (kept in FRAM, so it survives
     between queries and sequences); 'code' -> one bit per configured region; 'thumb' (args w, h) -> an 8-bit
-    block-mean thumbnail, the cheap check of semwisp.server.TieredServer."""
+    block-mean thumbnail, the cheap check of semwisp.server.TieredServer.
+    full_jpeg: None sends 'full' as raw 8-bit pixels; a quality (e.g. 88) sends it as a 160x120 JPEG scan
+    (semwisp.tag.JpegTag; the server needs the same full_jpeg to decode it)."""
 
-    def __init__(self):
+    def __init__(self, full_jpeg=None):
         self.code = None
+        self.jpeg = None
+        if full_jpeg is not None:
+            from .jpeg import JpegTag
+            self.jpeg = JpegTag(W, H, full_jpeg)
 
     def respond(self, request):
         if request.op == 'full':
+            if self.jpeg is not None:
+                scan = self.jpeg.encode(self.frame())                     # costs as JpegTag.respond
+                self.ledger.mcu_ops += H * W + 42 * W * H
+                self.ledger.ram_bytes = max(self.ledger.ram_bytes, 10 * W + len(scan))
+                return np.frombuffer(scan, np.uint8)
             self.ledger.ram_bytes = max(self.ledger.ram_bytes, W)          # stream it out row by row
             return self.frame().ravel()
         if request.op == 'config':

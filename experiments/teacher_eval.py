@@ -15,7 +15,7 @@ checkpointed to <sequence>.part.npz every --chunk frames and resumed from there.
   python experiments/teacher_eval.py --stride 8 --teachers frcnn_mnv3_320@320 frcnn_r50v2@480 retina_r50v2@480
   python experiments/teacher_eval.py --stride 2 --mall --batch 2 --teachers fcos_r50@480
 """
-import argparse, sys, time
+import argparse, re, sys, time
 from pathlib import Path
 
 import numpy as np
@@ -79,6 +79,26 @@ def score(model, X, flip, device, batch=8):
     return scores, boxes
 
 
+def degrade(kind, X):
+    """What a non-adaptive tag would send instead of the frame, as the server decodes it, and its size in bytes.
+    kind: 'gray' (the 160x120 frame itself), 'jpegWxHqQ' (semwisp.tag.JpegTag: block mean to WxH, JPEG at quality Q,
+    scan bytes only) or 'thumbWxH' (block mean to WxH, 8 bits per value)."""
+    if kind == 'gray':
+        return X, np.full(len(X), X[0].size)
+    m = re.fullmatch(r'jpeg(\d+)x(\d+)q(\d+)', kind)
+    if m:
+        from semwisp.tag.jpeg import JpegTag
+        tag = JpegTag(int(m[1]), int(m[2]), int(m[3]))
+        scans = [tag.encode(x) for x in X]
+        return np.stack([tag.decode(np.frombuffer(s, np.uint8)) for s in scans]), np.array([len(s) for s in scans])
+    m = re.fullmatch(r'thumb(\d+)x(\d+)', kind)
+    if m:
+        from semwisp.tag.thumbnail import block_mean
+        w, h = int(m[1]), int(m[2])
+        return np.stack([block_mean(x, w, h) for x in X]), np.full(len(X), w * h)
+    raise ValueError(kind)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--teachers', nargs='+', required=True, help='model@size[+flip], model one of ' + ', '.join(MODELS))
@@ -88,6 +108,9 @@ def main():
     ap.add_argument('--out', type=Path, default=OUT)
     ap.add_argument('--batch', type=int, default=8, help='frames per forward pass (lower it for memory)')
     ap.add_argument('--chunk', type=int, default=200, help='checkpoint a sequence every n frames')
+    ap.add_argument('--input', default='gray',
+                    help="what the detector sees: gray (the 160x120 frame), jpegWxHqQ or thumbWxH (a non-adaptive "
+                         "tag's payload, decoded); results go to <teacher>_<input>_s<stride>/ with per-frame bytes")
     args = ap.parse_args()
     for t in args.teachers:
         assert parse(t)[0] in MODELS, t
@@ -101,7 +124,7 @@ def main():
 
     for teacher in args.teachers:
         model_name, size, flip = parse(teacher)
-        folder = args.out / f'{teacher}_s{args.stride}'
+        folder = args.out / (f'{teacher}_s{args.stride}' if args.input == 'gray' else f'{teacher}_{args.input}_s{args.stride}')
         folder.mkdir(parents=True, exist_ok=True)
         model = None
         for name, (idx, s) in jobs.items():
@@ -119,17 +142,22 @@ def main():
                     sc[:done], bx[:done] = z['score'], z['box']
                 print(f'resume {teacher} {name} at {done}/{len(idx)}', flush=True)
             t0, n0 = time.time(), done
+            nbytes = degrade(args.input, s['X'][idx[:1]])[1][0] * np.ones(len(idx), np.int64)
+            if part.exists() and args.input != 'gray':
+                with np.load(part) as z:
+                    nbytes[:done] = z['bytes']
             while done < len(idx):
                 end = min(done + args.chunk, len(idx))
-                sc[done:end], bx[done:end] = score(model, s['X'][idx[done:end]], flip, device, args.batch)
+                Xin, nbytes[done:end] = degrade(args.input, s['X'][idx[done:end]])
+                sc[done:end], bx[done:end] = score(model, Xin, flip, device, args.batch)
                 done = end
                 tmp = out.with_name(out.stem + '.tmp.npz')
                 if done < len(idx):
-                    np.savez(tmp, score=sc[:done], box=bx[:done])
+                    np.savez(tmp, score=sc[:done], box=bx[:done], bytes=nbytes[:done])
                     tmp.replace(part)
                     print(f'  {teacher} {name}: {done}/{len(idx)}', flush=True)
                 else:
-                    np.savez(tmp, t=s['t'][idx], idx=idx, score=sc, box=bx)
+                    np.savez(tmp, t=s['t'][idx], idx=idx, score=sc, box=bx, bytes=nbytes)
                     tmp.replace(out)
                     part.unlink(missing_ok=True)
             n = max(len(idx) - n0, 1)

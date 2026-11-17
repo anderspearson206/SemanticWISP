@@ -153,14 +153,14 @@ class TieredServer(AdaptiveServer):
                 self.p_thumb = p
                 self.trusted_run += 1
                 self.disagree += 0.1 * (0.0 - self.disagree)
-                self.interval = int(np.clip(round(0.25 / max(self.disagree, 1e-3)), 2, self.max_interval))
+                self.set_interval()
             else:
                 self.why = ('unsure' if not sure else 'disagree' if (p >= 0.5) != (self.logit > 0) else 'floor')
                 self.p_thumb = p if sure else None
                 self.plan.append('full')
         elif request.op == 'full':
             self.trusted_run = 0
-            frame = rx.data.reshape(H, W)
+            frame = self.frame_of(rx)
             super().receive(request, rx)
             if self.changed:
                 self.dec.reset()
