@@ -2,3 +2,4 @@ from .adaptive import AdaptiveServer, BatchLearner, CachedTeacher, OnlineLearner
 from .decoders import CNNDecoder
 from .oneshot import OneShotServer
 from .tiered import ThumbDecoder, TieredServer
+from .temporal import TemporalServer

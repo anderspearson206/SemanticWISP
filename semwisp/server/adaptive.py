@@ -195,11 +195,18 @@ class OnlineLearner:
         w = np.linalg.solve(Ss, gap[sel])
         mu0, mu1 = w @ self.m[0, sel], w @ self.m[1, sel]
         cut = (mu0 + mu1) / 2
+        C = self.Sc[:, sel][:, :, sel] if self.Sc is not None else np.stack([S[np.ix_(sel, sel)]] * 2)
+        sd = [np.sqrt(max(w @ C[c] @ w, 1e-12)) for c in (0, 1)]
         if self.threshold == 'gauss':
-            sd = [np.sqrt(max(w @ self.Sc[c][np.ix_(sel, sel)] @ w, 1e-12)) for c in (0, 1)]
             cut = gauss_cross(mu0, sd[0], mu1, sd[1])
         full = self._full()
-        return IntervalCode(sel, full.lo[sel], full.hi[sel], self.table), Linear(w, -cut)
+        dec = Linear(w, -cut)
+        # Per-class statistics of what the server receives, for a server that models them (TemporalServer):
+        # the decoder output (mean, sd) and the share of code bits set (mean, sd), each for empty and person.
+        dec.out_stats = ((mu0 - cut, sd[0]), (mu1 - cut, sd[1]))
+        k = len(sel)
+        dec.frac_stats = tuple((float(self.m[c, sel].mean()), float(np.sqrt(max(C[c].sum(), 0)) / k)) for c in (0, 1))
+        return IntervalCode(sel, full.lo[sel], full.hi[sel], self.table), dec
 
 
 class CachedTeacher:

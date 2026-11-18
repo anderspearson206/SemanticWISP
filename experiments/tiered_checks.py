@@ -19,7 +19,8 @@ Teachers: `detector` (COCO detector on the 160x120 frame; no labels used anywher
 Learners: online_pixels (OnlineLearner, 96 single pixels), online_cells (OnlineLearner, whole blocks),
           batch_cells (BatchLearner, the baseline); online_pixels_cal and online_cells_cal are the online learners
           with a calibrated decoder (shrink=0.3, threshold='gauss'; see experiments/learner_ablation.py).
-Checks:   full (AdaptiveServer) or tiered (TieredServer).
+Checks:   full (AdaptiveServer), tiered (TieredServer) or temporal (TemporalServer: tiered, with a belief filtered
+          over time for the answer and the uncertain-answer thumbnails, and a per-room anomaly trigger).
 
 Results: results/tiered_checks/<stream>_<teacher>_<learner>_<check>_b<bootstrap>.npz, one row per query;
 existing files are skipped.
@@ -38,7 +39,7 @@ from semwisp import piropo
 from semwisp.calibrate import asymmetric_cutoffs
 from semwisp.frames import load_frames, load_mall_tile
 from semwisp.metrics import summary
-from semwisp.server import AdaptiveServer, BatchLearner, CachedTeacher, OnlineLearner, TieredServer
+from semwisp.server import AdaptiveServer, BatchLearner, CachedTeacher, OnlineLearner, TemporalServer, TieredServer
 from semwisp.sim import replay
 from semwisp.tag import IntervalCodeTag
 from semwisp.tag.interval import CELLS, lattice, sparse
@@ -61,7 +62,10 @@ RUNS = ([(s, t, l, c, 200) for s in ('piropo', 'switch') for t in TEACHERS for l
          for c in ('full', 'tiered')]
         + [('switch', t, l, 'tiered', b) for t in TEACHERS for l in ('online_pixels', 'batch_cells')
            for b in BOOTSTRAPS if b != 200]
-        + [('switch', 'fcos_jpeg', l, 'tiered', 200) for l in ('online_pixels_cal', 'online_cells_cal')])
+        + [('switch', 'fcos_jpeg', l, 'tiered', 200) for l in ('online_pixels_cal', 'online_cells_cal')]
+        + [(s, t, l, 'temporal', 200) for s, t in (('piropo', 'fcos'), ('switch', 'fcos'), ('switch', 'fcos_jpeg'),
+                                                    ('switch', 'oracle'))
+           for l in ('online_pixels_cal', 'online_cells_cal')])
 
 
 def every(s, k):
@@ -109,6 +113,8 @@ def make_server(teacher, learner, check, boot, k=96, margin=2.0, jpeg=None):
     teach, pos, neg = teacher
     L = LEARNERS[learner](k)
     kw = dict(bootstrap=boot, pos_thr=pos, neg_thr=neg, full_jpeg=jpeg)
+    if check == 'temporal':
+        return TemporalServer(teach, L, code_margin=margin, **kw)
     return (TieredServer(teach, L, code_margin=margin, **kw) if check == 'tiered' else AdaptiveServer(teach, L, **kw))
 
 
@@ -140,7 +146,7 @@ def main():
         code = server.active[0]
         meta = dict(name=name, stream=stream, teacher=teacher, learner=learner, check=check, bootstrap=boot,
                     pos_thr=teachers[teacher][1], neg_thr=teachers[teacher][2],
-                    full_jpeg=jpeg, k=args.k, margin=args.margin if check == 'tiered' else None, bits=len(code.cell),
+                    full_jpeg=jpeg, k=args.k, margin=args.margin if check != 'full' else None, bits=len(code.cell),
                     pixels_read=code.n_pixels, seconds=round(time.time() - t0),
                     by_pass={p: summary(g) for p, g in df.groupby('pass')})
         np.savez(out, meta=json.dumps(meta),

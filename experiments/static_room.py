@@ -16,6 +16,9 @@ Teachers:   fcos (cutoffs from unlabelled footage, as tiered_checks.py) and orac
 Schedules:  default   max_interval=64,   full_every=4,  noise_floor=0     (as tiered_checks.py)
             relaxed   max_interval=1024, full_every=16, noise_floor=0
             floor     max_interval=1024, full_every=16, noise_floor=0.05  (discount the teacher's own error rate)
+            relaxed_temporal  relaxed, with semwisp.server.TemporalServer: a belief filtered over time decides
+                              the answer and the uncertain-answer thumbnails, and the anomaly trigger is learned
+                              per room (2026-11-17); relaxed_smooth / relaxed_anomaly: each part alone
 Caveat: passes after the first replay identical frames, which overstates a real static room (lighting drifts).
 
 Results: results/static_room/<room>_<teacher>_<schedule>.npz, one row per query (as tiered_checks.py, plus
@@ -34,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from semwisp import piropo
 from semwisp.metrics import summary
-from semwisp.server import OnlineLearner, TieredServer
+from semwisp.server import OnlineLearner, TemporalServer, TieredServer
 from semwisp.sim import replay
 from semwisp.tag import IntervalCodeTag
 from semwisp.tag.interval import lattice, sparse
@@ -44,8 +47,13 @@ OUT = piropo.REPO / 'results' / 'static_room'
 SCHEDULES = {'default': dict(max_interval=64, full_every=4, noise_floor=0.0),
              'relaxed': dict(max_interval=1024, full_every=16, noise_floor=0.0),
              'floor': dict(max_interval=1024, full_every=16, noise_floor=0.05)}
+RELAXED = SCHEDULES['relaxed']
+TEMPORAL = {'relaxed_temporal': dict(smooth=True, learn_anomaly=True),         # TemporalServer options
+            'relaxed_smooth': dict(smooth=True, learn_anomaly=False),
+            'relaxed_anomaly': dict(smooth=False, learn_anomaly=True)}
+SCHEDULES.update({name: RELAXED for name in TEMPORAL})
 RUNS = ([(room, 'fcos', s) for room in ('A', 'mall') for s in SCHEDULES]
-        + [(room, 'oracle', s) for room in ('A', 'mall') for s in ('default', 'floor')])
+        + [(room, 'oracle', s) for room in ('A', 'mall') for s in ('default', 'floor', 'relaxed_temporal')])
 
 
 def rooms():
@@ -53,6 +61,16 @@ def rooms():
     P = streams['piropo'][0]
     mall = streams['switch'][0]['room B (mall tile)']
     return {'A': {n: P[n] for n in ('training', 'test3', 'test1')}, 'mall': {'mall tile': mall}}, teachers
+
+
+def make_server(teacher, sched, k=96, margin=2.0):
+    """teacher: (CachedTeacher, person cutoff, empty cutoff) from rooms(); sched: a SCHEDULES name."""
+    teach, pos, neg = teacher
+    kw = SCHEDULES[sched]
+    L = OnlineLearner(k=k, table=sparse(lattice(4), 4), shrink=0.3, threshold='gauss')
+    Server, extra = (TemporalServer, TEMPORAL[sched]) if sched in TEMPORAL else (TieredServer, {})
+    return Server(teach, L, code_margin=margin, pos_thr=pos, neg_thr=neg, bootstrap=200,
+                  max_interval=kw['max_interval'], full_every=kw['full_every'], noise_floor=kw['noise_floor'], **extra)
 
 
 def main():
@@ -76,9 +94,7 @@ def main():
         t0 = time.time()
         teach, pos, neg = teachers[teacher]
         kw = SCHEDULES[sched]
-        L = OnlineLearner(k=args.k, table=sparse(lattice(4), 4), shrink=0.3, threshold='gauss')
-        server = TieredServer(teach, L, code_margin=args.margin, pos_thr=pos, neg_thr=neg, bootstrap=200,
-                              max_interval=kw['max_interval'], full_every=kw['full_every'], noise_floor=kw['noise_floor'])
+        server = make_server(teachers[teacher], sched, args.k, args.margin)
         tag, parts = IntervalCodeTag(), []
         for p in range(1, args.passes + 1):
             parts.append(replay(R[room], tag, server, reset=False).df.assign(**{'pass': p}))
@@ -87,7 +103,7 @@ def main():
                   f"full frame on {m['full_frame_rate']:.1%}, thumbnail on {m.get('thumb_rate', 0):.1%}, "
                   f"median interval {parts[-1].interval.median():.0f} ({time.time() - t0:.0f}s)", flush=True)
         df = pd.concat(parts, ignore_index=True)
-        meta = dict(name=name, room=room, teacher=teacher, schedule=sched, **kw, k=args.k, margin=args.margin,
+        meta = dict(name=name, room=room, teacher=teacher, schedule=sched, **kw, **TEMPORAL.get(sched, {}), k=args.k, margin=args.margin,
                     pos_thr=pos, neg_thr=neg, passes=args.passes, seconds=round(time.time() - t0),
                     by_pass={p: summary(g) for p, g in df.groupby('pass')})
         tmp = out.with_name(out.stem + '.tmp.npz')
